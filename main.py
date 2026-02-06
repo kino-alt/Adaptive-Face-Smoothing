@@ -33,12 +33,30 @@ NOSE_BASE_INDEX = 2
 FRAME_W, FRAME_H = 640, 480
 PRINT_INTERVAL_SEC = 0.2  # コンソール出力の間隔（秒）
 DEFORM_POINTS_STEP = 1  # 変形用の点数を間引くなら2以上
-DEFORM_STRENGTH = 2.0  # 変形強度(1.0〜3.0)
-MOUTH_LIFT_PX = 2  # 口角を常時リフトする固定オフセット(px)
+DEFORM_STRENGTH = 1.2  # 変形強度(1.0〜3.0)
+MOUTH_LIFT_PX = 3  # 口角を常時リフトする固定オフセット(px)
 BROW_SMOOTH_FACTOR = -0.8  # 眉を下げた移動量への係数（上方向へ押し戻す）
 DEBUG_LINE_SCALE = 10.0  # 補正ラインを見やすくする倍率
-REMAP_RADIUS_PX = 30  # remapで動かす半径
-REMAP_SIGMA_PX = 10.0  # ガウス重みのsigma
+REMAP_RADIUS_PX = 30  # remapで動かす半径（眉用）
+REMAP_SIGMA_PX = 10.0  # ガウス重みのsigma（眉用）
+MOUTH_RADIUS_PX = 40  # 口角周辺の影響半径
+MOUTH_SIGMA_PX = 16.0  # 口角のガウス減衰
+CHEEK_LIFT_RATIO = 0.2  # 口角リフトに対する頬の持ち上げ比率
+MOUTH_CENTER_IDS = [13, 14]  # 唇中央付近（固定したい点）
+MOUTH_CENTER_RADIUS_PX = 22  # 口中央の固定領域半径
+MOUTH_CENTER_SIGMA_PX = 8.0  # 口中央の固定用ガウス
+MOUTH_CENTER_STRENGTH = 0.3  # 口中央の固定強度（小さいほど中心が動く）
+REMAP_Y_SIGN = -1.0  # Y方向の符号補正
+CORNER_SPREAD_RATIO = 0.12  # 口角の外側への広がり率
+LIP_CURVE_BLEND = 0.07 # 唇ラインをベジェ曲線へ寄せる強さ
+LIP_RADIUS_PX = 10  # 唇ラインの影響半径
+LIP_SIGMA_PX = 4.0  # 唇ラインのガウス減衰
+
+# 口の中心/ライン用ランドマーク
+UPPER_LIP_CENTER_ID = 0
+LOWER_LIP_CENTER_ID = 17
+UPPER_LIP_IDS = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291]
+LOWER_LIP_IDS = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291]
 
 # Face LandmarkerモデルのURLと保存先
 MODEL_URL = (
@@ -62,109 +80,6 @@ def ensure_model(path: str, url: str) -> None:
 def landmarks_to_points(landmarks, w, h):
     """正規化座標(0-1)をピクセル座標に変換して配列化する。"""
     return np.array([(lm.x * w, lm.y * h) for lm in landmarks], dtype=np.float32)
-
-
-# 役割: Delaunay三角形分割のインデックスを生成
-def build_delaunay_triangles(rect, points):
-    """Delaunay三角形分割のインデックス配列を作る。"""
-    subdiv = cv2.Subdiv2D(rect)
-    x0, y0, w, h = rect
-    x1, y1 = x0 + w - 1, y0 + h - 1
-    safe_points = []
-    for p in points:
-        # Subdiv2Dは範囲外の点で落ちるためクランプ
-        px = min(max(float(p[0]), x0), x1)
-        py = min(max(float(p[1]), y0), y1)
-        safe_points.append((px, py))
-        subdiv.insert((px, py))
-
-    tri_list = subdiv.getTriangleList()
-    tri_indices = []
-
-    point_map = {}
-    for i, p in enumerate(safe_points):
-        key = (int(round(p[0])), int(round(p[1])))
-        point_map[key] = i
-
-    for t in tri_list:
-        pts = [(t[0], t[1]), (t[2], t[3]), (t[4], t[5])]
-        idx = []
-        for (x, y) in pts:
-            key = (int(round(x)), int(round(y)))
-            if key in point_map:
-                idx.append(point_map[key])
-            else:
-                # 近傍点を探す（完全一致しない場合のフォールバック）
-                dmin, imin = 1e9, -1
-                for i, p in enumerate(safe_points):
-                    d = (p[0] - x) ** 2 + (p[1] - y) ** 2
-                    if d < dmin:
-                        dmin, imin = d, i
-                if imin >= 0:
-                    idx.append(imin)
-        if len(idx) == 3:
-            tri_indices.append(tuple(idx))
-
-    return tri_indices
-
-
-# 役割: 三角形単位でアフィン変換を行い画像に合成
-def warp_triangle(img, out, t_src, t_dst):
-    """1つの三角形をアフィン変換して合成する。"""
-    r1 = cv2.boundingRect(np.float32([t_src]))
-    r2 = cv2.boundingRect(np.float32([t_dst]))
-
-    # サイズが不正な場合はスキップ
-    if r1[2] <= 0 or r1[3] <= 0 or r2[2] <= 0 or r2[3] <= 0:
-        return
-
-    t1_rect = []
-    t2_rect = []
-    for i in range(3):
-        t1_rect.append(((t_src[i][0] - r1[0]), (t_src[i][1] - r1[1])))
-        t2_rect.append(((t_dst[i][0] - r2[0]), (t_dst[i][1] - r2[1])))
-
-    mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
-    cv2.fillConvexPoly(mask, np.int32(t2_rect), (1.0, 1.0, 1.0), 16, 0)
-
-    img1_rect = img[r1[1]:r1[1] + r1[3], r1[0]:r1[0] + r1[2]]
-    if img1_rect.size == 0:
-        return
-    warp_mat = cv2.getAffineTransform(np.float32(t1_rect), np.float32(t2_rect))
-    img2_rect = cv2.warpAffine(
-        img1_rect,
-        warp_mat,
-        (r2[2], r2[3]),
-        None,
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REFLECT_101,
-    )
-
-    out_region = out[r2[1]:r2[1] + r2[3], r2[0]:r2[0] + r2[2]]
-
-    # サイズ不一致の保険（まれに境界で1pxずれる）
-    h = min(out_region.shape[0], img2_rect.shape[0], mask.shape[0])
-    w = min(out_region.shape[1], img2_rect.shape[1], mask.shape[1])
-    if h <= 0 or w <= 0:
-        return
-
-    out_region = out_region[:h, :w]
-    img2_rect = img2_rect[:h, :w]
-    mask = mask[:h, :w]
-
-    out_region = out_region * (1 - mask) + img2_rect * mask
-    out[r2[1]:r2[1] + h, r2[0]:r2[0] + w] = out_region
-
-
-# 役割: 全三角形をワープして画像全体を変形
-def warp_image(img, src_points, dst_points, tri_indices):
-    """三角形ごとに変形して画像全体をワープする。"""
-    out = img.copy().astype(np.float32)
-    for i0, i1, i2 in tri_indices:
-        t_src = [src_points[i0], src_points[i1], src_points[i2]]
-        t_dst = [dst_points[i0], dst_points[i1], dst_points[i2]]
-        warp_triangle(img, out, t_src, t_dst)
-    return np.clip(out, 0, 255).astype(np.uint8)
 
 # カメラを初期化
 cap = cv2.VideoCapture(0)
@@ -381,39 +296,123 @@ try:
                 new_landmarks[KEYPOINTS["mouth_left"]][1] = corr_mouth_y * h
                 new_landmarks[KEYPOINTS["mouth_right"]][1] = corr_mouth_y * h
 
+                # 口角を外側にも広げる（移動量の20%）
+                corner_dy_px = abs((corr_mouth_y - mouth_y) * h)
+                corner_dx_px = corner_dy_px * CORNER_SPREAD_RATIO
+                new_landmarks[KEYPOINTS["mouth_left"]][0] = original_landmarks[KEYPOINTS["mouth_left"]][0] - corner_dx_px
+                new_landmarks[KEYPOINTS["mouth_right"]][0] = original_landmarks[KEYPOINTS["mouth_right"]][0] + corner_dx_px
+
+                # 頬（口角上部）も30%持ち上げる
+                cheek_dy = corner_dy_px * CHEEK_LIFT_RATIO
+                for cheek_id in (205, 425):
+                    new_landmarks[cheek_id][1] = original_landmarks[cheek_id][1] - cheek_dy
+
+                # 二次ベジェ曲線で唇ラインを再配置
+                upper_center = original_landmarks[UPPER_LIP_CENTER_ID]
+                lower_center = original_landmarks[LOWER_LIP_CENTER_ID]
+                left_corner = new_landmarks[KEYPOINTS["mouth_left"]]
+                right_corner = new_landmarks[KEYPOINTS["mouth_right"]]
+
+                mouth_center_x = (upper_center[0] + lower_center[0]) / 2.0
+                left_x = original_landmarks[KEYPOINTS["mouth_left"]][0]
+                right_x = original_landmarks[KEYPOINTS["mouth_right"]][0]
+
+                for idx in set(UPPER_LIP_IDS + LOWER_LIP_IDS):
+                    if idx in (UPPER_LIP_CENTER_ID, LOWER_LIP_CENTER_ID):
+                        continue
+                    px = original_landmarks[idx][0]
+                    if px <= mouth_center_x:
+                        denom = max(mouth_center_x - left_x, 1.0)
+                        t = np.clip((mouth_center_x - px) / denom, 0.0, 1.0)
+                        p0 = upper_center
+                        p1 = left_corner
+                        p2 = lower_center
+                    else:
+                        denom = max(right_x - mouth_center_x, 1.0)
+                        t = np.clip((px - mouth_center_x) / denom, 0.0, 1.0)
+                        p0 = upper_center
+                        p1 = right_corner
+                        p2 = lower_center
+
+                    # Quadratic Bezier
+                    bez_y = (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t ** 2 * p2[1]
+
+                    # 下唇は皿状になるように滑らかに補間
+                    if idx in LOWER_LIP_IDS:
+                        blend = LIP_CURVE_BLEND * (0.6 + 0.4 * t)
+                    else:
+                        blend = LIP_CURVE_BLEND
+
+                    new_landmarks[idx][1] = (1 - blend) * original_landmarks[idx][1] + blend * bez_y
+
                 # 影響範囲を限定した remap を作成
                 map_x = grid_x.copy()
                 map_y = grid_y.copy()
 
                 centers = [
-                    left_brow_inner_idx, left_brow_mid_idx, left_brow_tail_idx,
-                    right_brow_inner_idx, right_brow_mid_idx, right_brow_tail_idx,
-                    KEYPOINTS["mouth_left"], KEYPOINTS["mouth_right"],
+                    (left_brow_inner_idx, REMAP_RADIUS_PX, REMAP_SIGMA_PX),
+                    (left_brow_mid_idx, REMAP_RADIUS_PX, REMAP_SIGMA_PX),
+                    (left_brow_tail_idx, REMAP_RADIUS_PX, REMAP_SIGMA_PX),
+                    (right_brow_inner_idx, REMAP_RADIUS_PX, REMAP_SIGMA_PX),
+                    (right_brow_mid_idx, REMAP_RADIUS_PX, REMAP_SIGMA_PX),
+                    (right_brow_tail_idx, REMAP_RADIUS_PX, REMAP_SIGMA_PX),
+                    (KEYPOINTS["mouth_left"], MOUTH_RADIUS_PX, MOUTH_SIGMA_PX),
+                    (KEYPOINTS["mouth_right"], MOUTH_RADIUS_PX, MOUTH_SIGMA_PX),
+                    (205, MOUTH_RADIUS_PX, MOUTH_SIGMA_PX),
+                    (425, MOUTH_RADIUS_PX, MOUTH_SIGMA_PX),
                 ]
+                for lip_id in set(UPPER_LIP_IDS + LOWER_LIP_IDS):
+                    centers.append((lip_id, LIP_RADIUS_PX, LIP_SIGMA_PX))
 
-                for idx in centers:
+                for idx, radius_px, sigma_px in centers:
                     ox, oy = original_landmarks[idx]
                     nx, ny = new_landmarks[idx]
                     # remapは「出力画素が参照する入力座標」を指定するため、
                     # 変形は逆方向（元→新の差分を反転）で与える
                     dx = ox - nx
-                    dy = oy - ny
+                    dy = (oy - ny) * REMAP_Y_SIGN
                     if abs(dx) < 1e-3 and abs(dy) < 1e-3:
                         continue
 
-                    x0 = max(int(ox - REMAP_RADIUS_PX), 0)
-                    x1 = min(int(ox + REMAP_RADIUS_PX), w - 1)
-                    y0 = max(int(oy - REMAP_RADIUS_PX), 0)
-                    y1 = min(int(oy + REMAP_RADIUS_PX), h - 1)
+                    x0 = max(int(ox - radius_px), 0)
+                    x1 = min(int(ox + radius_px), w - 1)
+                    y0 = max(int(oy - radius_px), 0)
+                    y1 = min(int(oy + radius_px), h - 1)
                     if x1 <= x0 or y1 <= y0:
                         continue
 
                     roi_x = grid_x[y0:y1, x0:x1] - ox
                     roi_y = grid_y[y0:y1, x0:x1] - oy
-                    weight = np.exp(-(roi_x ** 2 + roi_y ** 2) / (2.0 * REMAP_SIGMA_PX ** 2))
+                    weight = np.exp(-(roi_x ** 2 + roi_y ** 2) / (2.0 * sigma_px ** 2))
 
                     map_x[y0:y1, x0:x1] += weight * dx
                     map_y[y0:y1, x0:x1] += weight * dy
+
+                # 口中央を固定するため、口角の平均移動量を打ち消す
+                mouth_dx = (
+                    (original_landmarks[KEYPOINTS["mouth_left"]][0] - new_landmarks[KEYPOINTS["mouth_left"]][0]) +
+                    (original_landmarks[KEYPOINTS["mouth_right"]][0] - new_landmarks[KEYPOINTS["mouth_right"]][0])
+                ) / 2.0
+                mouth_dy = (
+                    (original_landmarks[KEYPOINTS["mouth_left"]][1] - new_landmarks[KEYPOINTS["mouth_left"]][1]) +
+                    (original_landmarks[KEYPOINTS["mouth_right"]][1] - new_landmarks[KEYPOINTS["mouth_right"]][1])
+                ) / 2.0
+                mouth_dy *= REMAP_Y_SIGN
+
+                for center_id in MOUTH_CENTER_IDS:
+                    ox, oy = original_landmarks[center_id]
+                    x0 = max(int(ox - MOUTH_CENTER_RADIUS_PX), 0)
+                    x1 = min(int(ox + MOUTH_CENTER_RADIUS_PX), w - 1)
+                    y0 = max(int(oy - MOUTH_CENTER_RADIUS_PX), 0)
+                    y1 = min(int(oy + MOUTH_CENTER_RADIUS_PX), h - 1)
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+
+                    roi_x = grid_x[y0:y1, x0:x1] - ox
+                    roi_y = grid_y[y0:y1, x0:x1] - oy
+                    weight = np.exp(-(roi_x ** 2 + roi_y ** 2) / (2.0 * MOUTH_CENTER_SIGMA_PX ** 2))
+                    map_x[y0:y1, x0:x1] += weight * (-mouth_dx) * MOUTH_CENTER_STRENGTH
+                    map_y[y0:y1, x0:x1] += weight * (-mouth_dy) * MOUTH_CENTER_STRENGTH
 
                 # remapで変形を反映
                 display_frame = cv2.remap(
