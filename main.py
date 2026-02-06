@@ -16,10 +16,14 @@ KEYPOINTS = {
     "mouth_right": 291,
 }
 
-# 眉の候補点（左/右の眉ライン上）
-# ここから「顔の中心に近い点」を眉頭として選ぶ
-BROW_LEFT_CANDIDATES = [70, 63, 105, 66, 107]
-BROW_RIGHT_CANDIDATES = [300, 293, 334, 296, 336]
+# 眉ラインの候補点（左/右）
+# この集合から「眉頭・中央・眉尻」を動的に選ぶ
+BROW_LEFT_LINE = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46]
+BROW_RIGHT_LINE = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
+
+# 眉周辺の皮膚を連動させるための領域点（必要に応じて調整）
+BROW_LEFT_REGION = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46, 156, 143, 124, 46]
+BROW_RIGHT_REGION = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276, 383, 372, 353, 276]
 
 # 鼻の下（基準点）として使うランドマーク
 # 必要なら別番号に変更してください
@@ -30,6 +34,11 @@ FRAME_W, FRAME_H = 640, 480
 PRINT_INTERVAL_SEC = 0.2  # コンソール出力の間隔（秒）
 DEFORM_POINTS_STEP = 1  # 変形用の点数を間引くなら2以上
 DEFORM_STRENGTH = 2.0  # 変形強度(1.0〜3.0)
+MOUTH_LIFT_PX = 2  # 口角を常時リフトする固定オフセット(px)
+BROW_SMOOTH_FACTOR = -0.8  # 眉を下げた移動量への係数（上方向へ押し戻す）
+DEBUG_LINE_SCALE = 10.0  # 補正ラインを見やすくする倍率
+REMAP_RADIUS_PX = 30  # remapで動かす半径
+REMAP_SIGMA_PX = 10.0  # ガウス重みのsigma
 
 # Face LandmarkerモデルのURLと保存先
 MODEL_URL = (
@@ -169,6 +178,11 @@ frame_count = 0
 # キャリブレーション基準値
 baseline_brow_height = None  # 眉の上下位置（鼻の下基準、正規化y）
 baseline_mouth_height = None  # 口角高さ（鼻の下基準、正規化y）
+calibrated_view = False  # デバッグ表示用（通常はFalse）
+apply_correction = True
+grid_x = None
+grid_y = None
+grid_size = None
 
 ensure_model(MODEL_PATH, MODEL_URL)
 
@@ -191,6 +205,7 @@ try:
             break
 
         frame_count += 1
+        display_frame = frame
         if frame_skip > 1 and (frame_count % frame_skip) != 0:
             # スキップフレームはそのまま表示してUIだけ維持
             cv2.imshow("Face Landmarks", frame)
@@ -209,21 +224,56 @@ try:
             h, w, _ = frame.shape
             face_landmarks = results.face_landmarks[0]
             display_frame = frame
+            line_points = []
 
-            # 眉頭（内側）を動的に選ぶ
-            left_brow_idx = max(
-                BROW_LEFT_CANDIDATES, key=lambda i: face_landmarks[i].x
+            # remap用のグリッドを準備
+            if grid_size != (h, w):
+                grid_x, grid_y = np.meshgrid(
+                    np.arange(w, dtype=np.float32),
+                    np.arange(h, dtype=np.float32)
+                )
+                grid_size = (h, w)
+
+            # 眉頭・中央・眉尻を動的に選ぶ
+            left_sorted = sorted(BROW_LEFT_LINE, key=lambda i: face_landmarks[i].x)
+            left_brow_inner_idx = left_sorted[-2] if len(left_sorted) >= 2 else left_sorted[-1]
+            left_brow_tail_idx = min(
+                BROW_LEFT_LINE, key=lambda i: face_landmarks[i].x
             )
-            right_brow_idx = min(
-                BROW_RIGHT_CANDIDATES, key=lambda i: face_landmarks[i].x
+            left_mid_target = (
+                face_landmarks[left_brow_inner_idx].x +
+                face_landmarks[left_brow_tail_idx].x
+            ) / 2.0
+            left_brow_mid_idx = min(
+                BROW_LEFT_LINE, key=lambda i: abs(face_landmarks[i].x - left_mid_target)
+            )
+
+            right_sorted = sorted(BROW_RIGHT_LINE, key=lambda i: face_landmarks[i].x)
+            right_brow_inner_idx = right_sorted[1] if len(right_sorted) >= 2 else right_sorted[0]
+            right_brow_tail_idx = max(
+                BROW_RIGHT_LINE, key=lambda i: face_landmarks[i].x
+            )
+            right_mid_target = (
+                face_landmarks[right_brow_inner_idx].x +
+                face_landmarks[right_brow_tail_idx].x
+            ) / 2.0
+            right_brow_mid_idx = min(
+                BROW_RIGHT_LINE, key=lambda i: abs(face_landmarks[i].x - right_mid_target)
             )
 
             # 眉の上下位置と口角高さ（鼻の下基準）を計算
-            left_brow = face_landmarks[left_brow_idx]
-            right_brow = face_landmarks[right_brow_idx]
+            left_brow = face_landmarks[left_brow_inner_idx]
+            right_brow = face_landmarks[right_brow_inner_idx]
+            left_brow_mid = face_landmarks[left_brow_mid_idx]
+            right_brow_mid = face_landmarks[right_brow_mid_idx]
+            left_brow_tail = face_landmarks[left_brow_tail_idx]
+            right_brow_tail = face_landmarks[right_brow_tail_idx]
 
             nose_base = face_landmarks[NOSE_BASE_INDEX]
-            brow_y = (left_brow.y + right_brow.y) / 2.0
+            brow_y = (
+                left_brow.y + left_brow_mid.y + left_brow_tail.y +
+                right_brow.y + right_brow_mid.y + right_brow_tail.y
+            ) / 6.0
             # 鼻の下から眉までの相対高さ（値が大きいほど眉が高い）
             brow_height = nose_base.y - brow_y
             mouth_left = face_landmarks[KEYPOINTS["mouth_left"]]
@@ -238,102 +288,184 @@ try:
                 x, y = int(lm.x * w), int(lm.y * h)
                 cv2.circle(display_frame, (x, y), 4, (0, 255, 255), -1)  # 黄
 
-            for idx in (left_brow_idx, right_brow_idx):
+            for idx in (left_brow_inner_idx, right_brow_inner_idx):
                 lm = face_landmarks[idx]
                 x, y = int(lm.x * w), int(lm.y * h)
                 cv2.circle(display_frame, (x, y), 4, (255, 0, 255), -1)  # 紫
 
-            # キャリブレーションがあれば偏差を計算して表示・補正
-            if baseline_brow_height is not None and baseline_mouth_height is not None:
-                brow_delta = baseline_brow_height - brow_height
-                mouth_delta = baseline_mouth_height - mouth_height
+            # 補正座標の初期値（未補正）
+            corr_left_inner_y = left_brow.y
+            corr_left_mid_y = left_brow_mid.y
+            corr_left_tail_y = left_brow_tail.y
+            corr_right_inner_y = right_brow.y
+            corr_right_mid_y = right_brow_mid.y
+            corr_right_tail_y = right_brow_tail.y
+            corr_mouth_y = mouth_y
+            brow_offset = 0.0
+            do_warp = apply_correction
 
-                # マイナス方向（眉が下がる / 口角が下がる）の変化のみ対象
-                brow_neg = max(0.0, brow_delta)
-                mouth_neg = max(0.0, mouth_delta)
+            # 口角は常に固定オフセットでリフトアップ（補正ON時）
+            if apply_correction:
+                corr_mouth_y = mouth_y - (MOUTH_LIFT_PX / float(h))
 
-                cv2.putText(
-                    display_frame,
-                    f"brow_delta: {-brow_neg:.4f}",
-                    (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 200, 255),
-                    2,
-                )
-                cv2.putText(
-                    display_frame,
-                    f"mouth_delta: {-mouth_neg:.4f}",
-                    (10, 48),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 200, 255),
-                    2,
-                )
-
-                # 50%キャンセルした理想補正座標を計算
-                # 眉: 鼻の下基準で高さを上げる
-                corrected_brow_height = brow_height + (brow_neg * 0.5)
-                corr_brow_y = nose_base.y - corrected_brow_height
-
-                # 口角: 鼻の下基準で高さを上げる
-                corrected_mouth_height = mouth_height + (mouth_neg * 0.5)
-                corr_mouth_y = nose_base.y - corrected_mouth_height
+            # キャリブレーションがあれば眉の平滑化を計算
+            if apply_correction and baseline_brow_height is not None:
+                # 眉が下がった移動量を検知（基準より高さが減った分）
+                down_amount = max(0.0, baseline_brow_height - brow_height)
+                # 下がった分にマイナス係数を掛けて上方向へ押し戻す
+                corr_brow_y = brow_y + (down_amount * BROW_SMOOTH_FACTOR)
 
                 # 変形強度を適用（元座標との差分ベクトルを拡大）
                 corr_brow_y = brow_y + (corr_brow_y - brow_y) * DEFORM_STRENGTH
-                corr_mouth_y = mouth_y + (corr_mouth_y - mouth_y) * DEFORM_STRENGTH
 
-                # 補正点を別色で描画（青）
-                clx, cly = int(left_brow.x * w), int(corr_brow_y * h)
-                crx, cry = int(right_brow.x * w), int(corr_brow_y * h)
-                cv2.circle(display_frame, (clx, cly), 4, (255, 128, 0), -1)
-                cv2.circle(display_frame, (crx, cry), 4, (255, 128, 0), -1)
+                # 眉は形状を維持するため、全点に同じオフセットを適用
+                brow_offset = corr_brow_y - brow_y
+                corr_left_inner_y = left_brow.y + brow_offset
+                corr_left_mid_y = left_brow_mid.y + brow_offset
+                corr_left_tail_y = left_brow_tail.y + brow_offset
+                corr_right_inner_y = right_brow.y + brow_offset
+                corr_right_mid_y = right_brow_mid.y + brow_offset
+                corr_right_tail_y = right_brow_tail.y + brow_offset
 
-                mlx, mrx = int(mouth_left.x * w), int(mouth_right.x * w)
-                my = int(corr_mouth_y * h)
-                cv2.circle(display_frame, (mlx, my), 4, (255, 128, 0), -1)
-                cv2.circle(display_frame, (mrx, my), 4, (255, 128, 0), -1)
-
-                # メッシュ変形のための対応点を作成
-                src_points = landmarks_to_points(face_landmarks, w, h)
-                dst_points = src_points.copy()
-
-                dst_points[left_brow_idx][1] = corr_brow_y * h
-                dst_points[right_brow_idx][1] = corr_brow_y * h
-                dst_points[KEYPOINTS["mouth_left"]][1] = corr_mouth_y * h
-                dst_points[KEYPOINTS["mouth_right"]][1] = corr_mouth_y * h
-
-                # 変形点を間引く場合のインデックス
-                if DEFORM_POINTS_STEP > 1:
-                    indices = set(range(0, len(src_points), DEFORM_POINTS_STEP))
-                    indices.update(
-                        [left_brow_idx, right_brow_idx,
-                         KEYPOINTS["mouth_left"], KEYPOINTS["mouth_right"]]
+                # 補正量の可視化（通常表示時のみ）
+                if not calibrated_view:
+                    cv2.putText(
+                        display_frame,
+                        f"brow_down: {down_amount:.4f}",
+                        (10, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 200),
+                        2,
                     )
-                    indices = sorted(indices)
-                    src_points_sub = src_points[indices]
-                    dst_points_sub = dst_points[indices]
-                else:
-                    src_points_sub = src_points
-                    dst_points_sub = dst_points
+                    cv2.putText(
+                        display_frame,
+                        f"brow_offset: {brow_offset:.4f}",
+                        (10, 72),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 200),
+                        2,
+                    )
 
-                tri_indices = build_delaunay_triangles((0, 0, w, h), src_points_sub)
-                display_frame = warp_image(frame, src_points_sub, dst_points_sub, tri_indices)
+                # 眉の元位置→補正位置のラインを後で描画
+                line_points = [
+                    (left_brow.x, left_brow.y, corr_left_inner_y),
+                    (right_brow.x, right_brow.y, corr_right_inner_y),
+                ]
 
-                # デバッグ表示: 元のランドマーク(赤)のみ
-                for p in src_points_sub:
-                    cv2.circle(display_frame, (int(p[0]), int(p[1])), 2, (0, 0, 255), -1)
+                # 補正点の描画はワープ後に行う
+            else:
+                if not calibrated_view:
+                    cv2.putText(
+                        display_frame,
+                        "Press K to calibrate",
+                        (10, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                    )
 
-                # 眉頭は見えにくいので大きめに描画
-                bl = (int(left_brow.x * w), int(left_brow.y * h))
-                br = (int(right_brow.x * w), int(right_brow.y * h))
-                cbl = (int(left_brow.x * w), int(corr_brow_y * h))
-                cbr = (int(right_brow.x * w), int(corr_brow_y * h))
-                cv2.circle(display_frame, bl, 5, (0, 0, 255), 2)
-                cv2.circle(display_frame, br, 5, (0, 0, 255), 2)
-                cv2.circle(display_frame, cbl, 5, (255, 128, 0), 2)
-                cv2.circle(display_frame, cbr, 5, (255, 128, 0), 2)
+            if do_warp:
+                # new_landmarks と original_landmarks を作成（ピクセル座標）
+                original_landmarks = landmarks_to_points(face_landmarks, w, h)
+                new_landmarks = original_landmarks.copy()
+
+                new_landmarks[left_brow_inner_idx][1] = corr_left_inner_y * h
+                new_landmarks[left_brow_mid_idx][1] = corr_left_mid_y * h
+                new_landmarks[left_brow_tail_idx][1] = corr_left_tail_y * h
+                new_landmarks[right_brow_inner_idx][1] = corr_right_inner_y * h
+                new_landmarks[right_brow_mid_idx][1] = corr_right_mid_y * h
+                new_landmarks[right_brow_tail_idx][1] = corr_right_tail_y * h
+                new_landmarks[KEYPOINTS["mouth_left"]][1] = corr_mouth_y * h
+                new_landmarks[KEYPOINTS["mouth_right"]][1] = corr_mouth_y * h
+
+                # 影響範囲を限定した remap を作成
+                map_x = grid_x.copy()
+                map_y = grid_y.copy()
+
+                centers = [
+                    left_brow_inner_idx, left_brow_mid_idx, left_brow_tail_idx,
+                    right_brow_inner_idx, right_brow_mid_idx, right_brow_tail_idx,
+                    KEYPOINTS["mouth_left"], KEYPOINTS["mouth_right"],
+                ]
+
+                for idx in centers:
+                    ox, oy = original_landmarks[idx]
+                    nx, ny = new_landmarks[idx]
+                    # remapは「出力画素が参照する入力座標」を指定するため、
+                    # 変形は逆方向（元→新の差分を反転）で与える
+                    dx = ox - nx
+                    dy = oy - ny
+                    if abs(dx) < 1e-3 and abs(dy) < 1e-3:
+                        continue
+
+                    x0 = max(int(ox - REMAP_RADIUS_PX), 0)
+                    x1 = min(int(ox + REMAP_RADIUS_PX), w - 1)
+                    y0 = max(int(oy - REMAP_RADIUS_PX), 0)
+                    y1 = min(int(oy + REMAP_RADIUS_PX), h - 1)
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+
+                    roi_x = grid_x[y0:y1, x0:x1] - ox
+                    roi_y = grid_y[y0:y1, x0:x1] - oy
+                    weight = np.exp(-(roi_x ** 2 + roi_y ** 2) / (2.0 * REMAP_SIGMA_PX ** 2))
+
+                    map_x[y0:y1, x0:x1] += weight * dx
+                    map_y[y0:y1, x0:x1] += weight * dy
+
+                # remapで変形を反映
+                display_frame = cv2.remap(
+                    frame,
+                    map_x,
+                    map_y,
+                    interpolation=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT_101,
+                )
+
+            # キャリブレーション表示（デバッグ用）
+            if calibrated_view:
+                cv2.circle(display_frame, (int(left_brow.x * w), int(corr_left_inner_y * h)), 6, (255, 0, 0), -1)
+                cv2.circle(display_frame, (int(left_brow_mid.x * w), int(corr_left_mid_y * h)), 6, (255, 0, 0), -1)
+                cv2.circle(display_frame, (int(left_brow_tail.x * w), int(corr_left_tail_y * h)), 6, (255, 0, 0), -1)
+
+                cv2.circle(display_frame, (int(right_brow.x * w), int(corr_right_inner_y * h)), 6, (255, 0, 0), -1)
+                cv2.circle(display_frame, (int(right_brow_mid.x * w), int(corr_right_mid_y * h)), 6, (255, 0, 0), -1)
+                cv2.circle(display_frame, (int(right_brow_tail.x * w), int(corr_right_tail_y * h)), 6, (255, 0, 0), -1)
+                cv2.circle(display_frame, (int(mouth_left.x * w), int(corr_mouth_y * h)), 6, (255, 0, 0), -1)
+                cv2.circle(display_frame, (int(mouth_right.x * w), int(corr_mouth_y * h)), 6, (255, 0, 0), -1)
+
+            # 眉の元位置→補正位置を線で表示（ワープ後に描画）
+            if line_points:
+                for (sx, sy, cy) in line_points:
+                    # 視認性のためラインを拡大表示（描画のみ）
+                    dy = (cy - sy) * DEBUG_LINE_SCALE
+                    if abs(dy) < 0.005:
+                        dy = 0.02 if dy >= 0 else -0.02
+                    y2 = min(max(sy + dy, 0.0), 1.0)
+                    p1 = (int(sx * w), int(sy * h))
+                    p2 = (int(sx * w), int(y2 * h))
+                    cv2.line(display_frame, p1, p2, (0, 255, 0), 3)
+                    cv2.circle(display_frame, p1, 4, (0, 255, 0), -1)
+                    cv2.circle(display_frame, p2, 4, (0, 255, 0), -1)
+
+            # 補正点をワープ後に描画（実際の位置確認用）
+            if apply_correction and baseline_brow_height is not None:
+                for (sx, sy, cy) in [
+                    (left_brow.x, left_brow.y, corr_left_inner_y),
+                    (left_brow_mid.x, left_brow_mid.y, corr_left_mid_y),
+                    (left_brow_tail.x, left_brow_tail.y, corr_left_tail_y),
+                    (right_brow.x, right_brow.y, corr_right_inner_y),
+                    (right_brow_mid.x, right_brow_mid.y, corr_right_mid_y),
+                    (right_brow_tail.x, right_brow_tail.y, corr_right_tail_y),
+                ]:
+                    cv2.circle(display_frame, (int(sx * w), int(sy * h)), 3, (0, 0, 255), 1)
+                    cv2.circle(display_frame, (int(sx * w), int(cy * h)), 4, (255, 0, 0), -1)
+                cv2.circle(display_frame, (int(mouth_left.x * w), int(mouth_left.y * h)), 3, (0, 0, 255), 1)
+                cv2.circle(display_frame, (int(mouth_right.x * w), int(mouth_right.y * h)), 3, (0, 0, 255), 1)
+                cv2.circle(display_frame, (int(mouth_left.x * w), int(corr_mouth_y * h)), 4, (255, 0, 0), -1)
+                cv2.circle(display_frame, (int(mouth_right.x * w), int(corr_mouth_y * h)), 4, (255, 0, 0), -1)
 
             # 座標の出力は間引いて負荷を抑える
             now = time.time()
@@ -348,11 +480,36 @@ try:
                 coords["brow_inner_right"] = (right_brow.x, right_brow.y, right_brow.z)
                 print(coords)
 
-        cv2.imshow("Face Landmarks", display_frame if results.face_landmarks else frame)
+        # 1画面のみ表示（cキーで補正ON/OFF切り替え）
+        view_frame = display_frame if apply_correction else frame
+        status_text = "Correction: ON" if apply_correction else "Correction: OFF"
+        cv2.putText(
+            view_frame,
+            status_text,
+            (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            view_frame,
+            "C: toggle  K: calibrate",
+            (10, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 200, 200),
+            1,
+        )
+        cv2.imshow("Face Landmarks", view_frame)
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
-        if key == ord("s") and results.face_landmarks:
+        if key == ord("c"):
+            apply_correction = not apply_correction
+        if key == ord("v"):
+            calibrated_view = not calibrated_view
+        if key == ord("k") and results.face_landmarks:
             baseline_brow_height = brow_height
             baseline_mouth_height = mouth_height
             print("[Calibrated] brow_height=", baseline_brow_height,
